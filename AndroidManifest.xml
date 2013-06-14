@@ -2,7 +2,7 @@
         package="com.android.providers.media"
         android:sharedUserId="android.media"
         android:sharedUserLabel="@string/uid_label"
-        android:versionCode="511">
+        android:versionCode="512">
         
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
@@ -36,6 +36,10 @@
         </receiver>
 
         <receiver android:name="MediaScannerReceiver">
+            <intent-filter>
+                <action android:name="com.android.providers.media.SCAN_ALL" />
+                <action android:name="com.android.providers.media.DISMISS_SCAN" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>

@@ -67,6 +67,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.preference.PreferenceManager;
@@ -91,7 +92,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintWriter;
-import java.text.Collator;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -100,6 +100,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.PriorityQueue;
+import java.util.regex.Pattern;
 import java.util.Stack;
 
 import libcore.io.ErrnoException;
@@ -243,6 +244,12 @@ public class MediaProvider extends ContentProvider {
                     // If secondary external storage is ejected, then we delete all database
                     // entries for that storage from the files table.
                     synchronized (mDatabases) {
+                        // Don't delete entries if the eject is due to a shutdown
+                        if (!"".equals(SystemProperties.get("sys.shutdown.requested"))) {
+                            Log.d(TAG, "not deleting entries on eject due to shtudown");
+                            return;
+                        }
+
                         DatabaseHelper database = mDatabases.get(EXTERNAL_VOLUME);
                         Uri uri = Uri.parse("file://" + storage.getPath());
                         if (database != null) {
@@ -326,6 +333,9 @@ public class MediaProvider extends ContentProvider {
      * on demand, create and upgrade the schema, etc.
      */
     static final class DatabaseHelper extends SQLiteOpenHelper {
+        // Matches SQLite database temporary files.
+        private static final Pattern DB_TMPFILE_PAT = Pattern.compile("\\.db-\\w+\\z");
+
         final Context mContext;
         final String mName;
         final boolean mInternal;  // True if this is the internal database
@@ -430,6 +440,13 @@ public class MediaProvider extends ContentProvider {
             // delete external databases that have not been used in the past two months
             long twoMonthsAgo = now - OBSOLETE_DATABASE_DB;
             for (int i = 0; i < databases.length; i++) {
+                // Remove SQLite temporary files as they don't count as distinct databases.
+                if (DB_TMPFILE_PAT.matcher(databases[i]).find()) {
+                    databases[i] = null;
+                    count--;
+                    continue;
+                }
+
                 File other = mContext.getDatabasePath(databases[i]);
                 if (INTERNAL_DATABASE_NAME.equals(databases[i]) || file.equals(other)) {
                     databases[i] = null;
@@ -1751,6 +1768,15 @@ public class MediaProvider extends ContentProvider {
             updateBucketNames(db);
         }
 
+        if (fromVersion < 512) {
+            // remove primary key constraint because column time is not necessarily unique
+            db.execSQL("CREATE TABLE IF NOT EXISTS log_tmp (time DATETIME, message TEXT);");
+            db.execSQL("DELETE FROM log_tmp;");
+            db.execSQL("INSERT INTO log_tmp SELECT time, message FROM log;");
+            db.execSQL("DROP TABLE log;");
+            db.execSQL("ALTER TABLE log_tmp RENAME TO log;");
+        }
+
         sanityCheck(db, fromVersion);
         long elapsedSeconds = (SystemClock.currentTimeMicro() - startTime) / 1000000;
         logToDb(db, "Database upgraded from version " + fromVersion + " to " + toVersion
@@ -1765,7 +1791,7 @@ public class MediaProvider extends ContentProvider {
                 new String[] { message });
         // delete all but the last 500 rows
         db.execSQL("DELETE FROM log WHERE rowid IN" +
-                " (SELECT rowid FROM log ORDER BY time DESC LIMIT 500,-1);");
+                " (SELECT rowid FROM log ORDER BY rowid DESC LIMIT 500,-1);");
     }
 
     /**
@@ -2098,8 +2124,6 @@ public class MediaProvider extends ContentProvider {
             if (!TextUtils.isEmpty(filter)) {
                 String [] searchWords = filter.split(" ");
                 keywords = new String[searchWords.length];
-                Collator col = Collator.getInstance();
-                col.setStrength(Collator.PRIMARY);
                 for (int i = 0; i < searchWords.length; i++) {
                     String key = MediaStore.Audio.keyFor(searchWords[i]);
                     key = key.replace("\\", "\\\\");
@@ -2476,8 +2500,6 @@ public class MediaProvider extends ContentProvider {
         String [] searchWords = mSearchString.length() > 0 ?
                 mSearchString.split(" ") : new String[0];
         String [] wildcardWords = new String[searchWords.length];
-        Collator col = Collator.getInstance();
-        col.setStrength(Collator.PRIMARY);
         int len = searchWords.length;
         for (int i = 0; i < len; i++) {
             // Because we match on individual words here, we need to remove words
@@ -2758,14 +2780,8 @@ public class MediaProvider extends ContentProvider {
                 return cid;
             }
 
-            // Use "LIKE" instead of "=" on case insensitive file systems so we do a
-            // case insensitive match when looking for parent directory.
-            // TODO: investigate whether a "nocase" constraint on the column and
-            // using "=" would give the same result faster.
-            String selection = (mCaseInsensitivePaths ? MediaStore.MediaColumns.DATA + " LIKE ?1"
-                    // The like above makes it use the index.
-                    // The comparison below makes it correct when the path has wildcard chars
-                    + " AND lower(_data)=lower(?1)"
+            String selection = (mCaseInsensitivePaths ? MediaStore.MediaColumns.DATA
+                    + " =?1 COLLATE nocase"
                     // search only directories.
                     + " AND format=" + MtpConstants.FORMAT_ASSOCIATION
                     : MediaStore.MediaColumns.DATA + "=?");
@@ -3456,11 +3472,8 @@ public class MediaProvider extends ContentProvider {
         ContentValues mediatype = new ContentValues();
         mediatype.put("media_type", 0);
         int numrows = db.update("files", mediatype,
-                // the "like" test makes use of the index, while the lower() test ensures it
-                // doesn't match entries it shouldn't when the path contains sqlite wildcards
-                "_data LIKE ? AND lower(substr(_data,1,?))=lower(?)",
-                new String[] { hiddenroot  + "/%",
-                    "" + (hiddenroot.length() + 1), hiddenroot + "/"});
+                "_data >= ? COLLATE nocase AND _data < ? COLLATE nocase",
+                new String[] { hiddenroot  + "/", hiddenroot + "0"});
         helper.mNumUpdates += numrows;
         ContentResolver res = getContext().getContentResolver();
         res.notifyChange(Uri.parse("content://media/"), null);
@@ -3498,10 +3511,8 @@ public class MediaProvider extends ContentProvider {
         @Override
         public void onMediaScannerConnected() {
             Cursor c = mDb.query("files", openFileColumns,
-                    // the "like" test makes use of the index, while the lower() ensures it
-                    // doesn't match entries it shouldn't when the path contains sqlite wildcards
-                    "_data like ? AND lower(substr(_data,1,?))=lower(?)",
-                    new String[] { mPath + "/%", "" + (mPath.length() + 1), mPath + "/"},
+                    "_data >= ? COLLATE nocase AND _data < ? COLLATE nocase",
+                    new String[] { mPath + "/", mPath + "0"},
                     null, null, null);
             while (c.moveToNext()) {
                 String d = c.getString(0);
@@ -3985,7 +3996,7 @@ public class MediaProvider extends ContentProvider {
                         if (count > 0) {
                             // update the paths of any files and folders contained in the directory
                             Object[] bindArgs = new Object[] {newPath, oldPath.length() + 1,
-                                    oldPath + "/%", (oldPath.length() + 1), oldPath + "/",
+                                    oldPath + "/", oldPath + "0",
                                     // update bucket_display_name and bucket_id based on new path
                                     f.getName(),
                                     f.toString().toLowerCase().hashCode()
@@ -3995,10 +4006,7 @@ public class MediaProvider extends ContentProvider {
                                     // also update bucket_display_name
                                     ",bucket_display_name=?6" +
                                     ",bucket_id=?7" +
-                                    // the "like" test makes use of the index, while the lower()
-                                    // test ensures it doesn't match entries it shouldn't when the
-                                    // path contains sqlite wildcards
-                                    " WHERE _data LIKE ?3 AND lower(substr(_data,1,?4))=lower(?5);",
+                                    " WHERE _data >= ?3 COLLATE nocase AND _data < ?4 COLLATE nocase;",
                                     bindArgs);
                         }
 
@@ -4211,8 +4219,8 @@ public class MediaProvider extends ContentProvider {
             return 0;
         }
         db.beginTransaction();
+        int numlines = 0;
         try {
-            int numlines = 0;
             helper.mNumUpdates += 3;
             Cursor c = db.query("audio_playlists_map",
                     new String [] {"play_order" },
@@ -4250,13 +4258,17 @@ public class MediaProvider extends ContentProvider {
             db.execSQL("UPDATE audio_playlists_map SET play_order=" + to_play_order +
                     " WHERE play_order=-1 AND playlist_id=" + playlist);
             db.setTransactionSuccessful();
-            Uri uri = MediaStore.Audio.Playlists.EXTERNAL_CONTENT_URI
-                    .buildUpon().appendEncodedPath(String.valueOf(playlist)).build();
-            getContext().getContentResolver().notifyChange(uri, null);
-            return numlines;
         } finally {
             db.endTransaction();
         }
+
+        Uri uri = MediaStore.Audio.Playlists.EXTERNAL_CONTENT_URI
+                .buildUpon().appendEncodedPath(String.valueOf(playlist)).build();
+        // notifyChange() must be called after the database transaction is ended
+        // or the listeners will read the old data in the callback
+        getContext().getContentResolver().notifyChange(uri, null);
+
+        return numlines;
     }
 
     private static final String[] openFileColumns = new String[] {
@@ -4458,6 +4470,17 @@ public class MediaProvider extends ContentProvider {
         msg.sendToTarget();
     }
 
+    //Return true if the artPath is the dir as it in mExternalStoragePaths
+    //for multi storage support
+    private static boolean isRootStorageDir(String artPath) {
+        for ( int i = 0; i < mExternalStoragePaths.length; i++) {
+            if ((mExternalStoragePaths[i] != null) &&
+                    (artPath.equalsIgnoreCase(mExternalStoragePaths[i])))
+                return true;
+        }
+        return false;
+    }
+
     // Extract compressed image data from the audio file itself or, if that fails,
     // look for a file "AlbumArt.jpg" in the containing directory.
     private static byte[] getCompressedAlbumArt(Context context, String path) {
@@ -4486,7 +4509,6 @@ public class MediaProvider extends ContentProvider {
                 if (lastSlash > 0) {
 
                     String artPath = path.substring(0, lastSlash);
-                    String sdroot = mExternalStoragePaths[0];
                     String dwndir = Environment.getExternalStoragePublicDirectory(
                             Environment.DIRECTORY_DOWNLOADS).getAbsolutePath();
 
@@ -4494,7 +4516,7 @@ public class MediaProvider extends ContentProvider {
                     synchronized (sFolderArtMap) {
                         if (sFolderArtMap.containsKey(artPath)) {
                             bestmatch = sFolderArtMap.get(artPath);
-                        } else if (!artPath.equalsIgnoreCase(sdroot) &&
+                        } else if (!isRootStorageDir(artPath) &&
                                 !artPath.equalsIgnoreCase(dwndir)) {
                             File dir = new File(artPath);
                             String [] entrynames = dir.list();
@@ -4903,7 +4925,7 @@ public class MediaProvider extends ContentProvider {
         if (EXTERNAL_DATABASE_NAME.equals(name)) {
             return true;
         }
-        if (name.startsWith("external-")) {
+        if (name.startsWith("external-") && name.endsWith(".db")) {
             return true;
         }
         return false;
@@ -4986,15 +5008,15 @@ public class MediaProvider extends ContentProvider {
                         // external database files
                         File recentDbFile = null;
                         for (String database : context.databaseList()) {
-                            if (database.startsWith("external-")) {
+                            if (database.startsWith("external-") && database.endsWith(".db")) {
                                 File file = context.getDatabasePath(database);
                                 if (recentDbFile == null) {
                                     recentDbFile = file;
                                 } else if (file.lastModified() > recentDbFile.lastModified()) {
-                                    recentDbFile.delete();
+                                    context.deleteDatabase(recentDbFile.getName());
                                     recentDbFile = file;
                                 } else {
-                                    file.delete();
+                                    context.deleteDatabase(file.getName());
                                 }
                             }
                         }
@@ -5343,7 +5365,7 @@ public class MediaProvider extends ContentProvider {
             }
             if (dumpDbLog) {
                 c = db.query("log", new String[] {"time", "message"},
-                        null, null, null, null, "time");
+                        null, null, null, null, "rowid");
                 try {
                     if (c != null) {
                         while (c.moveToNext()) {
