@@ -54,10 +54,13 @@ public class MtpService extends Service {
             final StorageVolume primary = StorageManager.getPrimaryVolume(mVolumes);
             final String path = primary.getPath();
             if (path != null) {
-                String state = mStorageManager.getVolumeState(path);
-                if (Environment.MEDIA_MOUNTED.equals(state)) {
-                    addStorageLocked(mVolumeMap.get(path));
-                }
+		if(!path.equals("/storage/usbdisk0"))
+		{
+		        String state = mStorageManager.getVolumeState(path);
+		        if (Environment.MEDIA_MOUNTED.equals(state)) {
+		            addStorageLocked(mVolumeMap.get(path));
+		        }
+		}
             }
         } else {
             for (StorageVolume volume : mVolumeMap.values()) {
@@ -121,10 +124,13 @@ public class MtpService extends Service {
             mVolumes = volumes;
             for (int i = 0; i < volumes.length; i++) {
                 String path = volumes[i].getPath();
-                String state = mStorageManager.getVolumeState(path);
-                if (Environment.MEDIA_MOUNTED.equals(state)) {
-                    volumeMountedLocked(path);
-                }
+				if(	!path.equals("/storage/usbdisk0"))
+				{
+					String state = mStorageManager.getVolumeState(path);
+		        	if (Environment.MEDIA_MOUNTED.equals(state)) {
+		            	volumeMountedLocked(path);
+		        	}
+				}
             }
         }
     }
